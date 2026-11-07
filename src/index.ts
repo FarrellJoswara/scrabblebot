@@ -29,6 +29,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { chooseWord, decideBid } from "./strategy.js";
+import { display } from "./display.js";
 
 const HOST = process.env.STDB_HOST ?? "https://maincloud.spacetimedb.com";
 const DB_NAME = process.env.STDB_DB ?? "scrabblebot";
@@ -73,6 +74,37 @@ function resolveMyBotId(conn: DbConnection): bigint | null {
   return cred ? cred.botId : null;
 }
 
+function getActiveMatchId(conn: DbConnection): bigint | null {
+  if (myBotId === null) return null;
+  for (const p of conn.db.matchParticipant.iter()) {
+    if (p.botId !== myBotId) continue;
+    const m = conn.db.matchState.id.find(p.matchId);
+    if (m?.status.tag === "Running") return p.matchId;
+  }
+  return null;
+}
+
+function syncDashboard(conn: DbConnection) {
+  const matchId = getActiveMatchId(conn);
+  if (matchId !== null) {
+    const participant = participantForMatch(conn, matchId);
+    const rack = rackForMatch(conn, matchId);
+    display.update({
+      status: "In Match",
+      matchId,
+      score: participant?.score ?? 0,
+      balance: participant?.balance ?? 0,
+      rack,
+    });
+  } else {
+    display.update({
+      status: "In Lobby / Waiting",
+      matchId: null,
+      rack: new Map(),
+    });
+  }
+}
+
 function rackForMatch(
   conn: DbConnection,
   matchId: bigint,
@@ -104,8 +136,8 @@ function participantForMatch(
 // the bot.
 function logFailure(what: string) {
   return (err: unknown) =>
-    console.warn(
-      `[${BOT_NAME}] ${what} failed: ${err instanceof Error ? err.message : err}`,
+    display.warn(
+      `${what} failed: ${err instanceof Error ? err.message : err}`,
     );
 }
 
@@ -130,9 +162,8 @@ function tryBid(
     .submitBid({ auctionId, amount: BigInt(amount) })
     .catch(logFailure(`bid on auction ${auctionId}`));
   bidsByAuction.add(key);
-  console.log(
-    `[${BOT_NAME}] bid ${amount} on '${letter}' (match ${matchId}, auction ${auctionId})`,
-  );
+  display.log(`Bid ${amount} on '${letter}' (match ${matchId})`);
+  syncDashboard(conn);
 }
 
 function tryPlayWord(conn: DbConnection) {
@@ -155,80 +186,124 @@ function tryPlayWord(conn: DbConnection) {
       dictionary: DICTIONARY,
     });
     if (!word) continue;
-    console.log(`[${BOT_NAME}] match ${matchId}: playing '${word}'`);
+    display.update({ lastWord: word });
+    display.log(`Match ${matchId}: played '${word}'`);
     conn.reducers
       .submitWord({ matchId, word })
       .catch(logFailure(`playing '${word}'`));
+    syncDashboard(conn);
   }
 }
 
 function onConnect(conn: DbConnection, identity: Identity, token: string) {
   myIdentity = identity;
   saveToken(token);
-  console.log(`[${BOT_NAME}] connected as ${identity.toHexString()}`);
+  display.log(`Connected (${identity.toHexString().slice(0, 10)}…)`);
 
+  const finishConnect = () => {
+    // Resolve our bot id, possibly after claiming a nonce.
+    myBotId = resolveMyBotId(conn);
+    if (myBotId === null) {
+      if (BOT_NONCE) {
+        display.log("Claiming credential with nonce…");
+        conn.reducers
+          .claimCredential({ code: BOT_NONCE })
+          .catch(logFailure("claiming the credential"));
+        // Wait briefly for the credential to land; check again.
+        setTimeout(() => {
+          myBotId = resolveMyBotId(conn);
+          if (myBotId === null) {
+            display.warn("Couldn't claim credential. Bad / expired nonce?");
+            process.exit(1);
+          }
+          const bot = conn.db.bot.id.find(myBotId);
+          const actualName = bot?.name ?? BOT_NAME;
+          display.update({ botName: actualName, botId: myBotId, status: "Ready" });
+          display.log(
+            `Claimed credential for bot '${actualName}' (id ${myBotId})`,
+          );
+          bootstrapActivity(conn);
+        }, 1000);
+        return;
+      } else {
+        display.warn("No BotCredential for this token. Set BOT_TOKEN or BOT_NONCE and re-run.");
+        process.exit(1);
+      }
+    }
+
+    const bot = conn.db.bot.id.find(myBotId);
+    const actualName = bot?.name ?? BOT_NAME;
+    display.update({ botName: actualName, botId: myBotId, status: "Ready" });
+    display.log(`Acting as bot '${actualName}' (id ${myBotId})`);
+    bootstrapActivity(conn);
+  };
+
+  // Subscribe in two fast phases to avoid downloading millions of historical auctions.
   conn
     .subscriptionBuilder()
     .onApplied(() => {
-      console.log(`[${BOT_NAME}] subscription applied`);
+      display.log("Core tables synced");
 
-      // Resolve our bot id, possibly after claiming a nonce.
-      myBotId = resolveMyBotId(conn);
-      if (myBotId === null) {
-        if (BOT_NONCE) {
-          console.log(`[${BOT_NAME}] claiming credential with nonce…`);
-          conn.reducers
-            .claimCredential({ code: BOT_NONCE })
-            .catch(logFailure("claiming the credential"));
-          // Wait briefly for the credential to land; check again.
-          setTimeout(() => {
-            myBotId = resolveMyBotId(conn);
-            if (myBotId === null) {
-              console.error(
-                `[${BOT_NAME}] couldn't claim credential. Bad / expired nonce?`,
-              );
-              process.exit(1);
-            }
-            const bot = conn.db.bot.id.find(myBotId);
-            console.log(
-              `[${BOT_NAME}] claimed credential for bot '${bot?.name ?? "?"}' (id ${myBotId})`,
-            );
-            bootstrapActivity(conn);
-          }, 1000);
-          return;
-        } else {
-          console.error(
-            `[${BOT_NAME}] no BotCredential for this token. Set BOT_TOKEN or BOT_NONCE and re-run.`,
-          );
-          process.exit(1);
-        }
+      // Find highest match ID so we only replicate active & recent auctions
+      let maxMatchId = 0n;
+      for (const m of conn.db.matchState.iter()) {
+        if (m.id > maxMatchId) maxMatchId = m.id;
       }
+      const minMatchId = maxMatchId > 10n ? maxMatchId - 10n : 0n;
 
-      const bot = conn.db.bot.id.find(myBotId);
-      console.log(
-        `[${BOT_NAME}] acting as bot '${bot?.name ?? "?"}' (id ${myBotId})`,
-      );
-      bootstrapActivity(conn);
+      conn
+        .subscriptionBuilder()
+        .onApplied(() => {
+          display.log("Live auctions synced");
+          finishConnect();
+        })
+        .onError((ctx: ErrorContext) => {
+          display.warn(`Auction sync error`);
+          finishConnect();
+        })
+        .subscribe([
+          `SELECT * FROM auction WHERE match_id >= ${minMatchId}`,
+          `SELECT * FROM auction_result WHERE match_id >= ${minMatchId}`,
+        ]);
     })
-    .subscribeToAllTables();
+    .onError((ctx: ErrorContext) => {
+      display.warn(`Subscription error`);
+    })
+    .subscribe([
+      "SELECT * FROM bot",
+      "SELECT * FROM bot_credential",
+      "SELECT * FROM match_state",
+      "SELECT * FROM match_participant",
+      "SELECT * FROM my_rack",
+      "SELECT * FROM lobby",
+      "SELECT * FROM lobby_member",
+    ]);
 
   conn.db.auction.onInsert((_ctx: EventContext, a) => {
     if (a.status.tag === "Open") tryBid(conn, a.id, a.matchId, a.letter);
   });
-  conn.db.myRack.onInsert(() => tryPlayWord(conn));
-  conn.db.myRack.onUpdate(() => tryPlayWord(conn));
+  conn.db.myRack.onInsert(() => {
+    syncDashboard(conn);
+    tryPlayWord(conn);
+  });
+  conn.db.myRack.onUpdate(() => {
+    syncDashboard(conn);
+    tryPlayWord(conn);
+  });
   conn.db.botCredential.onInsert(() => {
-    if (myBotId === null) myBotId = resolveMyBotId(conn);
+    if (myBotId === null) {
+      myBotId = resolveMyBotId(conn);
+      if (myBotId !== null) display.update({ botId: myBotId });
+    }
   });
   conn.db.auctionResult.onInsert((_ctx, r) => {
     if (myBotId === null) return;
     const winner =
       r.winnerBotId !== undefined && r.winnerBotId !== null
-        ? String(r.winnerBotId)
+        ? (r.winnerBotId === myBotId ? "YOU" : `bot ${r.winnerBotId}`)
         : "no-bid";
-    console.log(
-      `[${BOT_NAME}] match ${r.matchId} auction ${r.auctionId} '${r.letter}' → bot ${winner} paid ${r.paid}`,
-    );
+    display.log(`Auction ${r.auctionId} '${r.letter}' → ${winner} paid ${r.paid}`);
+    syncDashboard(conn);
   });
 
   // When a match this bot was in ends, hop back into the lobby.
@@ -239,7 +314,8 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
         (p) => p.matchId === neu.id && p.botId === myBotId,
       );
       if (wasIn) {
-        console.log(`[${BOT_NAME}] match ${neu.id} ended; rejoining lobby`);
+        display.log(`Match ${neu.id} ended; rejoining lobby`);
+        display.update({ status: "Match Ended", matchId: null });
         joinLobby(conn);
       }
     }
@@ -263,7 +339,8 @@ function joinLobby(conn: DbConnection) {
       (lm) => lm.lobbyId === openLobby.id && lm.botId === myBotId,
     );
   if (alreadyIn) return;
-  console.log(`[${BOT_NAME}] joining lobby`);
+  display.log("Joining open lobby...");
+  display.update({ status: "Joining Lobby" });
   conn.reducers.joinLobby({}).catch(logFailure("joining the lobby"));
 }
 
@@ -272,7 +349,7 @@ function bootstrapActivity(conn: DbConnection) {
     conn.reducers
       .registerForTournament({ tournamentId: BigInt(TOURNAMENT_ID) })
       .then(() =>
-        console.log(`[${BOT_NAME}] registered for tournament ${TOURNAMENT_ID}`),
+        display.log(`Registered for tournament ${TOURNAMENT_ID}`),
       )
       .catch(logFailure(`registering for tournament ${TOURNAMENT_ID}`));
   }
@@ -284,16 +361,20 @@ function bootstrapActivity(conn: DbConnection) {
 }
 
 function main() {
-  console.log(`[${BOT_NAME}] connecting to ${DB_NAME} at ${HOST}`);
+  display.init(BOT_NAME);
+  display.log(`Connecting to ${DB_NAME} at ${HOST}`);
   DbConnection.builder()
     .withUri(HOST)
     .withDatabaseName(DB_NAME)
     .withToken(BOT_TOKEN ?? loadToken())
     .onConnect(onConnect)
     .onConnectError((_ctx: ErrorContext, err: Error) =>
-      console.error("connect error:", err.message),
+      display.warn(`Connect error: ${err.message}`),
     )
-    .onDisconnect(() => console.log("disconnected"))
+    .onDisconnect(() => {
+      display.update({ status: "Disconnected" });
+      display.warn("Disconnected");
+    })
     .build();
 }
 
