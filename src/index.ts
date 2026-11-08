@@ -56,6 +56,9 @@ loadLexicon();
 let myIdentity: Identity | null = null;
 let myBotId: bigint | null = null;
 const handledAuctions = new Set<string>();
+// Our matches: match id -> our match_participant row id. The tables hold
+// every match on the server, so do not scan them per event.
+const myMatches = new Map<bigint, bigint>();
 
 function resolveMyBotId(conn: DbConnection): bigint | null {
   if (!myIdentity) return null;
@@ -63,12 +66,22 @@ function resolveMyBotId(conn: DbConnection): bigint | null {
   return cred ? cred.botId : null;
 }
 
-function getActiveMatchId(conn: DbConnection): bigint | null {
-  if (myBotId === null) return null;
+// One full scan, at start. After this, matchParticipant.onInsert keeps
+// myMatches current.
+function indexMyMatches(conn: DbConnection) {
+  if (myBotId === null) return;
   for (const p of conn.db.matchParticipant.iter()) {
-    if (p.botId !== myBotId) continue;
-    const m = conn.db.matchState.id.find(p.matchId);
-    if (m?.status.tag === "Running") return p.matchId;
+    if (p.botId === myBotId) myMatches.set(p.matchId, p.id);
+  }
+}
+
+function isRunning(conn: DbConnection, matchId: bigint): boolean {
+  return conn.db.matchState.id.find(matchId)?.status.tag === "Running";
+}
+
+function getActiveMatchId(conn: DbConnection): bigint | null {
+  for (const matchId of myMatches.keys()) {
+    if (isRunning(conn, matchId)) return matchId;
   }
   return null;
 }
@@ -110,13 +123,10 @@ function participantForMatch(
   conn: DbConnection,
   matchId: bigint,
 ): { balance: number; score: number } | null {
-  if (myBotId === null) return null;
-  for (const p of conn.db.matchParticipant.iter()) {
-    if (p.matchId !== matchId) continue;
-    if (p.botId !== myBotId) continue;
-    return { balance: Number(p.balance), score: Number(p.score) };
-  }
-  return null;
+  const rowId = myMatches.get(matchId);
+  if (rowId === undefined) return null;
+  const p = conn.db.matchParticipant.id.find(rowId);
+  return p ? { balance: Number(p.balance), score: Number(p.score) } : null;
 }
 
 // A reducer call fails when the module refuses it, often for an expected
@@ -138,13 +148,16 @@ function actOnAuction(
   matchId: bigint,
   letter: string,
 ) {
-  if (myBotId === null) return;
+  if (myBotId === null || !myMatches.has(matchId)) return;
   const key = `${matchId}:${auctionId}`;
   if (handledAuctions.has(key)) return;
   const match = conn.db.matchState.id.find(matchId);
   if (match?.status.tag !== "Running") return;
   const participant = participantForMatch(conn, matchId);
-  if (!participant) return;
+  if (!participant) {
+    display.warn(`match ${matchId}: no participant row`);
+    return;
+  }
   handledAuctions.add(key);
 
   const t0 = performance.now();
@@ -268,10 +281,26 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
       "SELECT * FROM lobby_member",
     ]);
 
+  conn.db.matchParticipant.onInsert((_ctx, p) => {
+    if (myBotId !== null && p.botId === myBotId) {
+      myMatches.set(p.matchId, p.id);
+      display.log(`Seated in match ${p.matchId}`);
+    }
+  });
   conn.db.auction.onInsert((_ctx: EventContext, a) => {
     if (a.status.tag !== "Open") return;
-    // Let the rest of this transaction (rack, balance) reach the cache.
-    setImmediate(() => actOnAuction(conn, a.id, a.matchId, a.letter));
+    const lagMs = Date.now() - Number(a.opensAt.microsSinceUnixEpoch / 1000n);
+    // Let the rest of this transaction (our seat, rack, balance) reach the
+    // cache before the myMatches check.
+    setImmediate(() => {
+      if (!myMatches.has(a.matchId)) return;
+      if (lagMs > 300) display.warn(`auction ${a.id} seen ${lagMs}ms after open`);
+      try {
+        actOnAuction(conn, a.id, a.matchId, a.letter);
+      } catch (err) {
+        display.warn(`auction ${a.id}: ${err instanceof Error ? err.stack : err}`);
+      }
+    });
   });
   conn.db.myRack.onInsert(() => syncDashboard(conn));
   conn.db.myRack.onUpdate(() => syncDashboard(conn));
@@ -282,7 +311,7 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
     }
   });
   conn.db.auctionResult.onInsert((_ctx, r) => {
-    if (myBotId === null) return;
+    if (myBotId === null || !myMatches.has(r.matchId)) return;
     const winner =
       r.winnerBotId !== undefined && r.winnerBotId !== null
         ? (r.winnerBotId === myBotId ? "YOU" : `bot ${r.winnerBotId}`)
@@ -295,11 +324,9 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
   conn.db.matchState.onUpdate((_ctx, old, neu) => {
     if (myBotId === null) return;
     if (old.status.tag !== "Ended" && neu.status.tag === "Ended") {
-      const wasIn = Array.from(conn.db.matchParticipant.iter()).some(
-        (p) => p.matchId === neu.id && p.botId === myBotId,
-      );
-      if (wasIn) {
-        display.log(`Match ${neu.id} ended; rejoining lobby`);
+      if (myMatches.has(neu.id)) {
+        const p = participantForMatch(conn, neu.id);
+        display.log(`Match ${neu.id} ended: score ${p?.score}, balance ${p?.balance}; rejoining lobby`);
         display.update({ status: "Match Ended", matchId: null });
         joinLobby(conn);
       }
@@ -309,12 +336,7 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
 
 function joinLobby(conn: DbConnection) {
   if (myBotId === null) return;
-  const inRunning = Array.from(conn.db.matchParticipant.iter()).some((p) => {
-    if (p.botId !== myBotId) return false;
-    const m = conn.db.matchState.id.find(p.matchId);
-    return m?.status.tag === "Running";
-  });
-  if (inRunning) return;
+  if (getActiveMatchId(conn) !== null) return;
   const openLobby = Array.from(conn.db.lobby.iter()).find(
     (l) => l.status.tag === "Open",
   );
@@ -338,6 +360,7 @@ function bootstrapActivity(conn: DbConnection) {
       )
       .catch(logFailure(`registering for tournament ${TOURNAMENT_ID}`));
   }
+  indexMyMatches(conn);
   joinLobby(conn);
   for (const a of conn.db.auction.iter()) {
     if (a.status.tag === "Open") actOnAuction(conn, a.id, a.matchId, a.letter);

@@ -1,4 +1,7 @@
 // Clean terminal dashboard for ScrabbleBot to prevent terminal flooding.
+// All log lines also go to logs/<bot name>.log.
+
+import * as fs from "node:fs";
 
 export interface DashboardState {
   botName: string;
@@ -38,8 +41,12 @@ class Dashboard {
   private renderScheduled = false;
   private isTTY = Boolean(process.stdout.isTTY);
 
+  private logFile: string | null = null;
+
   init(botName: string) {
     this.state.botName = botName;
+    fs.mkdirSync("logs", { recursive: true });
+    this.logFile = `logs/${botName}.log`;
     this.scheduleRender();
   }
 
@@ -51,6 +58,9 @@ class Dashboard {
   log(msg: string) {
     const time = new Date().toTimeString().split(" ")[0];
     const line = `[${time}] ${msg}`;
+    if (this.logFile) {
+      fs.appendFileSync(this.logFile, `${new Date().toISOString()} ${msg}\n`);
+    }
     if (!this.isTTY) {
       console.log(line);
       return;
