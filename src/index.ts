@@ -167,6 +167,7 @@ function actOnAuction(
     bagRemaining: match.bagTotal,
     isLastAuction: match.bagTotal === 0,
     balance: participant.balance,
+    auctionType: match.auctionType.tag as "FirstPrice" | "Vickrey",
   }, TRAINED_PARAMS);
   const ms = (performance.now() - t0).toFixed(0);
 

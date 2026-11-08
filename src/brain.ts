@@ -64,6 +64,7 @@ export interface BrainInput {
   bagRemaining: number;
   isLastAuction: boolean;
   balance: number;
+  auctionType?: "Vickrey" | "FirstPrice";
 }
 
 export interface Decision {
@@ -248,12 +249,18 @@ export function decide(input: BrainInput, p: BrainParams = DEFAULT_PARAMS): Deci
     else if (input.letter === "E") synAdj += 1.0;
   }
 
-  const rawValue =
+  let rawValue =
     p.a +
     p.b * letterValue(input.letter) +
     p.c * gain +
     p.vowelWeight * vowelAdj +
     p.synergyWeight * synAdj;
+
+  // In FirstPrice auctions, the winner pays their own bid directly (not 2nd price).
+  // Shading the bid prevents early coin exhaustion.
+  if (input.auctionType === "FirstPrice") {
+    rawValue = Math.max(1, rawValue * 0.72);
+  }
 
   // Budget pacing: don't stake more than budgetFrac of remaining balance per
   // auction, but allow at least 1 when balance > 0.
