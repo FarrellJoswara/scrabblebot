@@ -55,6 +55,7 @@ loadLexicon();
 
 let myIdentity: Identity | null = null;
 let myBotId: bigint | null = null;
+let isReady = false;
 const handledAuctions = new Set<string>();
 // Our matches: match id -> our match_participant row id. The tables hold
 // every match on the server, so do not scan them per event.
@@ -239,6 +240,7 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
     display.update({ botName: actualName, botId: myBotId, status: "Ready" });
     display.log(`Acting as bot '${actualName}' (id ${myBotId})`);
     bootstrapActivity(conn);
+    isReady = true;
   };
 
   // Subscribe in two fast phases to avoid downloading millions of historical auctions.
@@ -253,6 +255,7 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
         if (m.id > maxMatchId) maxMatchId = m.id;
       }
       const minMatchId = maxMatchId > 10n ? maxMatchId - 10n : 0n;
+      display.log(`Max match id: ${maxMatchId}, subscribing from ${minMatchId}`);
 
       conn
         .subscriptionBuilder()
@@ -285,11 +288,11 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
   conn.db.matchParticipant.onInsert((_ctx, p) => {
     if (myBotId !== null && p.botId === myBotId) {
       myMatches.set(p.matchId, p.id);
-      display.log(`Seated in match ${p.matchId}`);
+      if (isReady) display.log(`Seated in match ${p.matchId}`);
     }
   });
   conn.db.auction.onInsert((_ctx: EventContext, a) => {
-    if (a.status.tag !== "Open") return;
+    if (!isReady || a.status.tag !== "Open") return;
     const lagMs = Date.now() - Number(a.opensAt.microsSinceUnixEpoch / 1000n);
     // Let the rest of this transaction (our seat, rack, balance) reach the
     // cache before the myMatches check.
@@ -303,8 +306,8 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
       }
     });
   });
-  conn.db.myRack.onInsert(() => syncDashboard(conn));
-  conn.db.myRack.onUpdate(() => syncDashboard(conn));
+  conn.db.myRack.onInsert(() => { if (isReady) syncDashboard(conn); });
+  conn.db.myRack.onUpdate(() => { if (isReady) syncDashboard(conn); });
   conn.db.botCredential.onInsert(() => {
     if (myBotId === null) {
       myBotId = resolveMyBotId(conn);
@@ -312,7 +315,7 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
     }
   });
   conn.db.auctionResult.onInsert((_ctx, r) => {
-    if (myBotId === null || !myMatches.has(r.matchId)) return;
+    if (!isReady || myBotId === null || !myMatches.has(r.matchId)) return;
     const winner =
       r.winnerBotId !== undefined && r.winnerBotId !== null
         ? (r.winnerBotId === myBotId ? "YOU" : `bot ${r.winnerBotId}`)
