@@ -4,6 +4,7 @@ import { loadLexicon } from "./dictionary.js";
 import type { BotPlayer, Player, SimPlayer, SimStrategy, View } from "./engine.js";
 import type { Rng } from "./rng.js";
 import { chooseWord, decideBid } from "../strategy.js";
+import { decide, DEFAULT_PARAMS, type BrainParams } from "../brain.js";
 
 // The six sim bots on the live server. A lobby that times out is padded
 // with a random subset of these.
@@ -51,15 +52,26 @@ export function baseline(name = "baseline"): BotPlayer {
   };
 }
 
+// The new strategy in src/brain.ts.
+export function babbler(params: BrainParams = DEFAULT_PARAMS, name = "babbler"): BotPlayer {
+  return { kind: "bot", name, act: (view: View) => decide(view, params) };
+}
+
 // Builds a lineup from tokens. "pool" takes a sim from SIM_POOL that is not
 // used yet in this lineup.
-export function buildLineup(tokens: string[], rng: Rng): Player[] {
+export function buildLineup(
+  tokens: string[],
+  rng: Rng,
+  params: BrainParams = DEFAULT_PARAMS,
+): Player[] {
   const pool = [...SIM_POOL];
   rng.shuffle(pool);
   return tokens.map((t, i) => {
     switch (t) {
       case "baseline":
         return baseline();
+      case "babbler":
+        return babbler(params);
       case "pool": {
         const next = pool.shift();
         if (!next) throw new Error("Sim pool is empty");

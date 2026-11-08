@@ -6,13 +6,15 @@
 //   --matches N     number of matches (default 1000)
 //   --seed N        base seed (default 1). Match i uses seed + i.
 //   --auction T     Vickrey | FirstPrice (default Vickrey)
-//   --lineup L      comma list: baseline, pool, cheapskate, value, aggressive
+//   --lineup L      comma list: babbler, baseline, pool, cheapskate, value, aggressive
+//   --p K=V,...     override babbler params, e.g. --p a=3,c=1.5
 //
 // Sim names are grouped by strategy in the output.
 
 import { runMatch, type AuctionType } from "./engine.js";
 import { buildLineup } from "./players.js";
 import { Rng } from "./rng.js";
+import { DEFAULT_PARAMS, type BrainParams } from "../brain.js";
 
 function arg(name: string, def: string): string {
   const i = process.argv.indexOf(`--${name}`);
@@ -33,12 +35,18 @@ interface Acc {
 const matches = Number(arg("matches", "1000"));
 const seed = Number(arg("seed", "1"));
 const auctionType = arg("auction", "Vickrey") as AuctionType;
-const tokens = arg("lineup", "baseline,pool,pool,pool,pool,pool").split(",");
+const tokens = arg("lineup", "babbler,pool,pool,pool,pool,pool").split(",");
+const params: BrainParams = { ...DEFAULT_PARAMS };
+for (const kv of arg("p", "").split(",").filter(Boolean)) {
+  const [k, v] = kv.split("=");
+  if (!(k! in params)) throw new Error(`Unknown param: ${k}`);
+  (params as unknown as Record<string, number>)[k!] = Number(v);
+}
 
 const stats = new Map<string, Acc>();
 const t0 = Date.now();
 for (let m = 0; m < matches; m++) {
-  const players = buildLineup(tokens, new Rng(seed * 7919 + m));
+  const players = buildLineup(tokens, new Rng(seed * 7919 + m), params);
   const res = runMatch(players, { seed: seed + m, auctionType });
   res.seats.forEach((s, i) => {
     const p = players[i]!;

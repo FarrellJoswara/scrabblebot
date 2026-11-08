@@ -17,7 +17,7 @@
 // registers the bot for that tournament when it connects. Only the bot
 // itself can register, so this has to come from the bot's process.
 //
-// Edit ./src/strategy.ts to customise how your bot bids and plays words.
+// Strategy lives in ./src/brain.ts. Test changes with `npm run sim`.
 
 import {
   DbConnection,
@@ -27,8 +27,8 @@ import {
 import { Identity } from "spacetimedb";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
-import { chooseWord, decideBid } from "./strategy.js";
+import { decide } from "./brain.js";
+import { loadLexicon } from "./sim/dictionary.js";
 import { display } from "./display.js";
 
 const HOST = process.env.STDB_HOST ?? "https://maincloud.spacetimedb.com";
@@ -50,23 +50,12 @@ function saveToken(tok: string) {
   fs.writeFileSync(TOKEN_PATH, tok);
 }
 
-// Load the shared wordlist so the bot can pick playable words locally.
-const currentDir = path.dirname(fileURLToPath(import.meta.url));
-const dictionaryPath = path.join(currentDir, "..", "spacetimedb", "wordlist.txt");
-const DICTIONARY: string[] = fs.existsSync(dictionaryPath)
-  ? fs
-      .readFileSync(dictionaryPath, "utf8")
-      .split("\n")
-      .map((l) => l.trim().toUpperCase())
-      .filter((l) => l.length >= 2)
-  : [];
-DICTIONARY.sort((a, b) => b.length - a.length); // longest first for greedy pick
+// Load the wordlist now, not in the first auction window.
+loadLexicon();
 
 let myIdentity: Identity | null = null;
 let myBotId: bigint | null = null;
-const bidsByAuction = new Set<string>();
-const lastWordAttemptByMatch = new Map<string, number>();
-const WORD_RETRY_MS = 500;
+const handledAuctions = new Set<string>();
 
 function resolveMyBotId(conn: DbConnection): bigint | null {
   if (!myIdentity) return null;
@@ -141,7 +130,9 @@ function logFailure(what: string) {
     );
 }
 
-function tryBid(
+// Decide once per open auction: play words, then bid. Words go first so
+// their reward can fund the bid.
+function actOnAuction(
   conn: DbConnection,
   auctionId: bigint,
   matchId: bigint,
@@ -149,50 +140,48 @@ function tryBid(
 ) {
   if (myBotId === null) return;
   const key = `${matchId}:${auctionId}`;
-  if (bidsByAuction.has(key)) return;
+  if (handledAuctions.has(key)) return;
+  const match = conn.db.matchState.id.find(matchId);
+  if (match?.status.tag !== "Running") return;
   const participant = participantForMatch(conn, matchId);
   if (!participant) return;
-  const amount = decideBid({
-    letter,
-    myBalance: participant.balance,
-    myRack: rackForMatch(conn, matchId),
-  });
-  if (amount <= 0) return;
-  conn.reducers
-    .submitBid({ auctionId, amount: BigInt(amount) })
-    .catch(logFailure(`bid on auction ${auctionId}`));
-  bidsByAuction.add(key);
-  display.log(`Bid ${amount} on '${letter}' (match ${matchId})`);
-  syncDashboard(conn);
-}
+  handledAuctions.add(key);
 
-function tryPlayWord(conn: DbConnection) {
-  if (myBotId === null) return;
-  // Only matches still being played. The bot keeps its letters from
-  // matches that have ended, but can't play them.
-  const matches = new Set<bigint>();
-  for (const p of conn.db.matchParticipant.iter()) {
-    if (p.botId !== myBotId) continue;
-    const m = conn.db.matchState.id.find(p.matchId);
-    if (m?.status.tag === "Running") matches.add(p.matchId);
-  }
-  const now = Date.now();
-  for (const matchId of matches) {
-    const key = String(matchId);
-    if (now - (lastWordAttemptByMatch.get(key) ?? 0) < WORD_RETRY_MS) continue;
-    lastWordAttemptByMatch.set(key, now);
-    const word = chooseWord({
-      myRack: rackForMatch(conn, matchId),
-      dictionary: DICTIONARY,
-    });
-    if (!word) continue;
-    display.update({ lastWord: word });
-    display.log(`Match ${matchId}: played '${word}'`);
+  const t0 = performance.now();
+  const d = decide({
+    rack: rackForMatch(conn, matchId),
+    letter,
+    bagRemaining: match.bagTotal,
+    isLastAuction: match.bagTotal === 0,
+    balance: participant.balance,
+  });
+  const ms = (performance.now() - t0).toFixed(0);
+
+  for (const word of d.words) {
     conn.reducers
       .submitWord({ matchId, word })
       .catch(logFailure(`playing '${word}'`));
-    syncDashboard(conn);
+    display.update({ lastWord: word });
+    display.log(`Match ${matchId}: played '${word}'`);
   }
+  if (d.bid > 0) {
+    conn.reducers
+      .submitBid({ auctionId, amount: BigInt(d.bid) })
+      .catch((err: unknown) => {
+        logFailure(`bid ${d.bid} on auction ${auctionId}`)(err);
+        // A word in this batch may have failed. Bid what we have.
+        const retry = Math.min(d.bid, participantForMatch(conn, matchId)?.balance ?? 0);
+        if (retry > 0 && retry < d.bid) {
+          conn.reducers
+            .submitBid({ auctionId, amount: BigInt(retry) })
+            .catch(logFailure(`retry bid ${retry}`));
+        }
+      });
+  }
+  display.log(
+    `Match ${matchId} r${match.currentRound} '${letter}': bid ${d.bid} (bag ${match.bagTotal}, ${ms}ms)`,
+  );
+  syncDashboard(conn);
 }
 
 function onConnect(conn: DbConnection, identity: Identity, token: string) {
@@ -280,16 +269,12 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
     ]);
 
   conn.db.auction.onInsert((_ctx: EventContext, a) => {
-    if (a.status.tag === "Open") tryBid(conn, a.id, a.matchId, a.letter);
+    if (a.status.tag !== "Open") return;
+    // Let the rest of this transaction (rack, balance) reach the cache.
+    setImmediate(() => actOnAuction(conn, a.id, a.matchId, a.letter));
   });
-  conn.db.myRack.onInsert(() => {
-    syncDashboard(conn);
-    tryPlayWord(conn);
-  });
-  conn.db.myRack.onUpdate(() => {
-    syncDashboard(conn);
-    tryPlayWord(conn);
-  });
+  conn.db.myRack.onInsert(() => syncDashboard(conn));
+  conn.db.myRack.onUpdate(() => syncDashboard(conn));
   conn.db.botCredential.onInsert(() => {
     if (myBotId === null) {
       myBotId = resolveMyBotId(conn);
@@ -355,9 +340,8 @@ function bootstrapActivity(conn: DbConnection) {
   }
   joinLobby(conn);
   for (const a of conn.db.auction.iter()) {
-    if (a.status.tag === "Open") tryBid(conn, a.id, a.matchId, a.letter);
+    if (a.status.tag === "Open") actOnAuction(conn, a.id, a.matchId, a.letter);
   }
-  tryPlayWord(conn);
 }
 
 function main() {
