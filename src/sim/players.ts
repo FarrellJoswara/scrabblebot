@@ -55,7 +55,24 @@ export function baseline(name = "baseline"): BotPlayer {
 // The new strategy in src/brain.ts.  Defaults to TRAINED_PARAMS (from
 // best-params.json) so `npm run sim` automatically benchmarks the trained bot.
 export function babbler(params: BrainParams = TRAINED_PARAMS, name = "babbler"): BotPlayer {
-  return { kind: "bot", name, act: (view: View) => decide(view, params) };
+  return {
+    kind: "bot",
+    name,
+    act: (view: View) =>
+      decide(
+        {
+          ...view,
+          seats: view.standings.length,
+          history: view.history.map((h) => ({
+            letter: h.letter,
+            winner: h.winner === null ? null : h.winner === view.seat ? "me" : "other",
+            paid: h.paid,
+          })),
+          myWords: view.plays.filter((p) => p.seat === view.seat).map((p) => p.word),
+        },
+        params,
+      ),
+  };
 }
 
 // Builds a lineup from tokens. "pool" takes a sim from SIM_POOL that is not

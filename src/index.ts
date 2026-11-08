@@ -24,10 +24,11 @@ import {
   type EventContext,
   type ErrorContext,
 } from "./module_bindings/index.js";
+import type { AuctionResult, MatchParticipant } from "./module_bindings/types.js";
 import { Identity } from "spacetimedb";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { decide, TRAINED_PARAMS } from "./brain.js";
+import { decide, TRAINED_PARAMS, type AuctionSeen } from "./brain.js";
 import { loadLexicon } from "./sim/dictionary.js";
 import { display } from "./display.js";
 
@@ -58,8 +59,49 @@ let myBotId: bigint | null = null;
 let isReady = false;
 const handledAuctions = new Set<string>();
 // Our matches: match id -> our match_participant row id. The tables hold
-// every match on the server, so do not scan them per event.
+// every match on the server, so do not scan them per event. Note: SDK
+// index find/filter also scans the full table.
 const myMatches = new Map<bigint, bigint>();
+
+// Per match, kept current from insert events: closed auctions (by
+// auction id), participant row ids, and the words we played. Removed when
+// the match ends.
+interface Closed {
+  letter: string;
+  winnerBotId: bigint | null;
+  paid: number;
+}
+const matchClosed = new Map<bigint, Map<bigint, Closed>>();
+const matchSeats = new Map<bigint, Set<bigint>>();
+const myWords = new Map<bigint, string[]>();
+
+function recordResult(r: AuctionResult) {
+  let m = matchClosed.get(r.matchId);
+  if (!m) matchClosed.set(r.matchId, (m = new Map()));
+  m.set(r.auctionId, {
+    letter: r.letter,
+    winnerBotId: r.winnerBotId ?? null,
+    paid: Number(r.paid),
+  });
+}
+
+function recordSeat(p: MatchParticipant) {
+  let s = matchSeats.get(p.matchId);
+  if (!s) matchSeats.set(p.matchId, (s = new Set()));
+  s.add(p.id);
+}
+
+function historyFor(matchId: bigint): AuctionSeen[] {
+  const m = matchClosed.get(matchId);
+  if (!m) return [];
+  return [...m.entries()]
+    .sort((a, b) => (a[0] < b[0] ? -1 : 1))
+    .map(([, c]) => ({
+      letter: c.letter,
+      winner: c.winnerBotId === null ? null : c.winnerBotId === myBotId ? "me" : "other",
+      paid: c.paid,
+    }));
+}
 
 function resolveMyBotId(conn: DbConnection): bigint | null {
   if (!myIdentity) return null;
@@ -71,8 +113,14 @@ function resolveMyBotId(conn: DbConnection): bigint | null {
 // myMatches current.
 function indexMyMatches(conn: DbConnection) {
   if (myBotId === null) return;
-  for (const p of conn.db.matchParticipant.iter()) {
+  const all = [...conn.db.matchParticipant.iter()];
+  for (const p of all) {
     if (p.botId === myBotId) myMatches.set(p.matchId, p.id);
+  }
+  // Match data for a match in progress at startup.
+  for (const p of all) if (myMatches.has(p.matchId)) recordSeat(p);
+  for (const r of conn.db.auctionResult.iter()) {
+    if (myMatches.has(r.matchId)) recordResult(r);
   }
 }
 
@@ -169,12 +217,20 @@ function actOnAuction(
     isLastAuction: match.bagTotal === 0,
     balance: participant.balance,
     auctionType: match.auctionType.tag as "FirstPrice" | "Vickrey",
+    seats: matchSeats.get(matchId)?.size || 6,
+    history: historyFor(matchId),
+    myWords: myWords.get(matchId) ?? [],
   }, TRAINED_PARAMS);
   const ms = (performance.now() - t0).toFixed(0);
 
   for (const word of d.words) {
     conn.reducers
       .submitWord({ matchId, word })
+      .then(() => {
+        const ws = myWords.get(matchId) ?? [];
+        ws.push(word);
+        myWords.set(matchId, ws);
+      })
       .catch(logFailure(`playing '${word}'`));
     display.update({ lastWord: word });
     display.log(`Match ${matchId}: played '${word}'`);
@@ -286,6 +342,7 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
     ]);
 
   conn.db.matchParticipant.onInsert((_ctx, p) => {
+    recordSeat(p);
     if (myBotId !== null && p.botId === myBotId) {
       myMatches.set(p.matchId, p.id);
       if (isReady) display.log(`Seated in match ${p.matchId}`);
@@ -315,6 +372,7 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
     }
   });
   conn.db.auctionResult.onInsert((_ctx, r) => {
+    recordResult(r);
     if (!isReady || myBotId === null || !myMatches.has(r.matchId)) return;
     const winner =
       r.winnerBotId !== undefined && r.winnerBotId !== null
@@ -326,6 +384,11 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
 
   // When a match this bot was in ends, hop back into the lobby.
   conn.db.matchState.onUpdate((_ctx, old, neu) => {
+    if (old.status.tag !== "Ended" && neu.status.tag === "Ended") {
+      matchClosed.delete(neu.id);
+      matchSeats.delete(neu.id);
+      myWords.delete(neu.id);
+    }
     if (myBotId === null) return;
     if (old.status.tag !== "Ended" && neu.status.tag === "Ended") {
       if (myMatches.has(neu.id)) {

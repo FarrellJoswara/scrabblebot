@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { decide, DEFAULT_PARAMS, type BrainInput } from "./brain.js";
+import { findBestPlayable, rackToCounts } from "./sim/dictionary.js";
+import { Rng } from "./sim/rng.js";
+import { bestSplit, keyWord, wordsIn } from "./words.js";
 
 function makeInput(overrides: Partial<BrainInput> = {}): BrainInput {
   return {
@@ -13,62 +16,69 @@ function makeInput(overrides: Partial<BrainInput> = {}): BrainInput {
   };
 }
 
-test("decide flushes full rack when bag < flushAt", () => {
-  const input = makeInput({
+const STONER = new Map([["S", 1], ["T", 1], ["O", 1], ["N", 1], ["E", 1], ["R", 1]]);
+
+test("last auction: bid 0 and play the full rack", () => {
+  const d = decide(makeInput({
     rack: new Map([["C", 1], ["A", 1], ["T", 1], ["S", 1]]),
-    bagRemaining: 1, // < flushAt (default 2)
-  });
-  const d = decide(input);
-  assert.ok(d.words.length > 0, "should play words in endgame");
-  assert.ok(d.words.includes("CATS") || d.words.includes("ACTS"), "should find best split");
+    bagRemaining: 0,
+    isLastAuction: true,
+  }));
+  assert.equal(d.bid, 0);
+  assert.equal(d.words.length, 1);
+  assert.equal(d.words[0]!.length, 4);
 });
 
-test("decide respects budgetFrac cap on bids", () => {
-  const input = makeInput({
-    balance: 10,
-    letter: "Q", // high value letter
-  });
-  const p = { ...DEFAULT_PARAMS, budgetFrac: 0.2, a: 10, b: 5, c: 5 };
-  const d = decide(input, p);
-  // Cap is floor(10 * 0.2) = 2
-  assert.ok(d.bid <= 2, `bid ${d.bid} should be <= budgetCap of 2`);
+test("bid never exceeds balance", () => {
+  for (const balance of [0, 1, 3, 10]) {
+    const d = decide(makeInput({ rack: STONER, letter: "Z", balance, bagRemaining: 3 }));
+    assert.ok(d.bid >= 0 && d.bid <= balance, `bid ${d.bid}, balance ${balance}`);
+  }
 });
 
-test("decide bids 0 on last auction", () => {
-  const input = makeInput({ isLastAuction: true });
-  const d = decide(input);
-  assert.equal(d.bid, 0, "should not bid on last auction");
+test("second-to-last auction: value only what the letter completes now", () => {
+  // No future tiles. A makes SENATOR (+6); Q and L improve nothing.
+  const bid = (letter: string) =>
+    decide(makeInput({ rack: STONER, letter, bagRemaining: 1 })).bid;
+  assert.ok(bid("A") > 0, `A ${bid("A")}`);
+  assert.equal(bid("Q"), 0);
+  assert.equal(bid("L"), 0);
 });
 
-test("decide triggers rack pressure when rack size >= maxRack", () => {
-  // Fill rack with 10 letters that contain a playable word
-  const rack = new Map<string, number>([
-    ["C", 1], ["A", 1], ["T", 1], // spells CAT (length 3, normally held in mid-game)
-    ["B", 1], ["D", 1], ["F", 1], ["G", 1], ["H", 1], ["J", 1], ["K", 1],
-  ]);
-  const input = makeInput({
-    rack,
-    bagRemaining: 50, // midgame where normal threshold is 7
-  });
-  const p = { ...DEFAULT_PARAMS, maxRack: 9, playLen: 7 };
-  const d = decide(input, p);
-  assert.ok(d.words.length > 0, "should play a word under rack pressure even if < playLen");
+test("holds STONER early for a longer word", () => {
+  assert.deepEqual(decide(makeInput({ rack: STONER, bagRemaining: 50 })).words, []);
 });
 
-test("decide boosts bid on U when holding Q", () => {
-  const rackWithQ = new Map([["Q", 1], ["B", 1], ["T", 1]]);
-  const rackWithoutQ = new Map([["B", 1], ["D", 1], ["T", 1]]);
-
-  const d1 = decide(makeInput({ rack: rackWithQ, letter: "U" }));
-  const d2 = decide(makeInput({ rack: rackWithoutQ, letter: "U" }));
-  assert.ok(d1.bid > d2.bid, `Bid with Q (${d1.bid}) should be higher than without Q (${d2.bid})`);
+test("first-price bid is not above the second-price bid", () => {
+  const input = makeInput({ rack: STONER, letter: "A" });
+  const v = decide({ ...input, auctionType: "Vickrey" });
+  const f = decide({ ...input, auctionType: "FirstPrice" });
+  assert.ok(f.bid <= v.bid, `first-price ${f.bid}, Vickrey ${v.bid}`);
 });
 
-test("decide penalizes bid on duplicate awkward consonants", () => {
-  const rackWithZ = new Map([["Z", 1], ["A", 1], ["T", 1]]);
-  const rackNormal = new Map([["C", 1], ["A", 1], ["T", 1]]);
+test("decide is deterministic", () => {
+  const input = makeInput({ rack: STONER, letter: "D" });
+  assert.deepEqual(decide(input), decide(input));
+});
 
-  const dWithZ = decide(makeInput({ rack: rackWithZ, letter: "J" }));
-  const dNormal = decide(makeInput({ rack: rackNormal, letter: "J" }));
-  assert.ok(dNormal.bid >= dWithZ.bid, `Bid on J with Z already (${dWithZ.bid}) should be <= bid on J without Z (${dNormal.bid})`);
+test("wordsIn finds the server's longest word", () => {
+  const rng = new Rng(7);
+  const letters = "AABCDEEEFGHIIKLMNNOOPRRSSTTUVWY";
+  for (let n = 0; n < 200; n++) {
+    const rack = new Map<string, number>();
+    const size = rng.int(2, 10);
+    for (let i = 0; i < size; i++) {
+      const c = letters[rng.int(0, letters.length - 1)]!;
+      rack.set(c, (rack.get(c) ?? 0) + 1);
+    }
+    const server = findBestPlayable(rack, 2);
+    const longest = Math.max(0, ...wordsIn(rackToCounts(rack)).map((k) => keyWord(k).length));
+    assert.equal(longest, server?.length ?? 0, [...rack].join());
+  }
+});
+
+test("bestSplit uses each tile at most once", () => {
+  const rc = rackToCounts(STONER);
+  const words = bestSplit(rc, DEFAULT_PARAMS.beam).keys.map(keyWord);
+  assert.equal(words.join("").length, 6);
 });

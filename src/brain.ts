@@ -1,56 +1,80 @@
-// Babbler strategy. Shared by the live bot and the simulator.
+// Strategy. Shared by the live bot and the simulator.
 //
-// Words:
-//   Mid-game: play if rack is overflowing OR a word meets the length threshold.
-//   The threshold graduates down as the bag empties so we don't hoard tiles.
-//   Endgame (bag < flushAt): play the best split of the full rack.
+// Our own implementation of the design that K-13 (ScrabbleBot tournament #1
+// winner) publishes in aryamehr2k/k13-scrabblebot docs/HOW-IT-WORKS.md. That
+// repo has no license, so no code is copied from it.
 //
-// Bids: value a letter by its static value PLUS how much it improves the best
-//   possible word-split of our current rack.  Budget is paced so we don't
-//   blow all our coins in the first few auctions.
+// 1. Unseen pool: full bag, minus auctioned letters, minus our start tiles.
+// 2. Letter value (points): Monte Carlo. Sample future tiles F from the
+//    pool. value(L) = mean[best(rack+L+F) - best(rack+F)]. All comparisons
+//    use the same futures (common random numbers), so the noise cancels.
+// 3. Coin price lambda (points per coin): bisection, so that the bids on all
+//    auctions left spend the balance plus expected word income. Early, coins
+//    are scarce and lambda is high. Late, lambda falls and bids rise.
+// 4. Bid: maximize P(win) * value - lambda * E[price] over 0..balance. The
+//    rival price model uses the prices paid in this match.
+// 5. Play/hold: play a word only if
+//    reward * (1 + coinBonus * lambda) + E[best(rest+F)] - E[best(rack+F)]
+//    is at least playMargin.
+// 6. Endgame: no future tiles on the second-to-last auction. On the last
+//    auction, bid 0 (a tile won there cannot be played) and play the best
+//    split of the full rack.
+//
+// Not done yet (K-13 has these): per-opponent bid models mined from the
+// public archive, a rival-denial term in the bid, hidden-tile inference
+// from opponent words, and a two-stage (quick, then refined) live bid.
 
-import { loadLexicon, rackToCounts } from "./sim/dictionary.js";
-import { letterValue, wordReward } from "./sim/rules.js";
+import { rackToCounts } from "./sim/dictionary.js";
+import { Rng } from "./sim/rng.js";
+import { DEFAULT_BAG, letterValue } from "./sim/rules.js";
+import { bestSplit, keyReward, keyWord, splitScore, take, wordsIn } from "./words.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 export interface BrainParams {
-  flushAt: number;    // start full-rack flush when bag has fewer tiles than this
-  playLen: number;    // mid-game minimum word length (graduates down near endgame)
-  maxRack: number;    // play best word of any length when rack >= this many tiles
-  a: number;          // bid = a + b * letterValue + c * gain + adjustments
-  b: number;
-  c: number;
-  vowelWeight: number;// weight for vowel/consonant balance heuristics
-  synergyWeight: number; // weight for Q+U, awkward consonant avoidance, S/E versatility
-  budgetFrac: number; // fraction of remaining budget we're willing to bid per auction
-  beam: number;       // beam width for bestSplit
+  samples: number; // Monte Carlo futures per decision
+  horizon: number; // max future tiles in one future
+  beam: number; // bestSplit beam width
+  lambdaLetters: number; // pool letters sampled to estimate future spend
+  lambdaMin: number; // floor for lambda (points per coin)
+  incomeFrac: number; // part of expected word reward counted as spendable
+  coinBonus: number; // a reward is also coins: extra value per point, times lambda
+  playMargin: number; // play when play beats hold by this many points
+  playCands: number; // words considered per play decision
+  priceWindow: number; // recent auction prices in the price model
+  priorN: number; // prior price samples when the match has fewer prices
 }
 
 export const DEFAULT_PARAMS: BrainParams = {
-  flushAt: 2,
-  playLen: 7,
-  maxRack: 9,
-  a: 3,
-  b: 0.8,
-  c: 1.2,
-  vowelWeight: 1.0,
-  synergyWeight: 1.0,
-  budgetFrac: 0.25,
-  beam: 12,
+  samples: 24,
+  horizon: 4,
+  beam: 6,
+  lambdaLetters: 4,
+  lambdaMin: 0.2,
+  incomeFrac: 0.5,
+  coinBonus: 0.32,
+  playMargin: 2.7,
+  playCands: 6,
+  priceWindow: 30,
+  priorN: 8,
 };
 
-// Load trained params from best-params.json if present, fall back to defaults.
+// Trained params from best-params.json override the defaults. Keys that
+// are not in BrainParams are ignored.
 function loadParams(): BrainParams {
   try {
-    const paramsPath = path.join(
+    const file = path.join(
       path.dirname(fileURLToPath(import.meta.url)),
       "..",
       "best-params.json",
     );
-    const raw = JSON.parse(fs.readFileSync(paramsPath, "utf8")) as Partial<BrainParams>;
-    return { ...DEFAULT_PARAMS, ...raw };
+    const raw = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, number>;
+    const p = { ...DEFAULT_PARAMS };
+    for (const k of Object.keys(p) as (keyof BrainParams)[]) {
+      if (typeof raw[k] === "number") p[k] = raw[k];
+    }
+    return p;
   } catch {
     return { ...DEFAULT_PARAMS };
   }
@@ -58,13 +82,23 @@ function loadParams(): BrainParams {
 
 export const TRAINED_PARAMS: BrainParams = loadParams();
 
+// One closed auction of the current match.
+export interface AuctionSeen {
+  letter: string;
+  winner: "me" | "other" | null;
+  paid: number;
+}
+
 export interface BrainInput {
   rack: ReadonlyMap<string, number>;
   letter: string;
-  bagRemaining: number;
+  bagRemaining: number; // tiles left in the bag after this one
   isLastAuction: boolean;
   balance: number;
   auctionType?: "Vickrey" | "FirstPrice";
+  seats?: number; // bots in the match (default 6)
+  history?: readonly AuctionSeen[]; // closed auctions of this match, in order
+  myWords?: readonly string[]; // words we played in this match
 }
 
 export interface Decision {
@@ -72,200 +106,233 @@ export interface Decision {
   bid: number;
 }
 
-interface Cand {
-  idx: number;
-  reward: number;
+const LAMBDA_MAX = 50;
+const MAX_WORDS_PER_TURN = 3;
+
+const idx = (c: string) => c.charCodeAt(0) - 65;
+
+// Letters that can still come up: the bag, plus rivals' hidden start tiles.
+function unseenPool(input: BrainInput, rc: number[]): number[] {
+  const n = new Array<number>(26).fill(0);
+  for (const [l, c] of DEFAULT_BAG) n[idx(l)] = c;
+  n[idx(input.letter)]!--;
+  // Our start tiles = rack + letters we played - letters we won.
+  const start = [...rc];
+  for (const w of input.myWords ?? []) for (const c of w) start[idx(c)]!++;
+  for (const h of input.history ?? []) {
+    n[idx(h.letter)]!--;
+    if (h.winner === "me") start[idx(h.letter)]!--;
+  }
+  const pool: number[] = [];
+  for (let i = 0; i < 26; i++) {
+    const left = n[i]! - Math.max(0, start[i]!);
+    for (let k = 0; k < left; k++) pool.push(i);
+  }
+  return pool;
 }
 
-// All words the rack can spell, sorted by reward desc.
-function candidates(rc: number[]): Cand[] {
-  const { byLength, masks, counts } = loadLexicon();
-  let total = 0;
-  let mask = 0;
-  for (let i = 0; i < 26; i++) {
-    total += rc[i]!;
-    if (rc[i]! > 0) mask |= 1 << i;
+// Expected number of tiles we will still win and be able to play.
+function futureTiles(input: BrainInput, p: BrainParams): number {
+  const usable = input.bagRemaining - 1; // the last tile cannot be played
+  if (usable <= 0) return 0;
+  const hist = input.history ?? [];
+  const mine = hist.filter((h) => h.winner === "me").length;
+  const share = (mine + 1) / (hist.length + (input.seats ?? 6));
+  return Math.min(p.horizon, Math.round(usable * share));
+}
+
+function sampleFutures(pool: number[], k: number, n: number, rng: Rng): number[][] {
+  if (k === 0 || pool.length === 0) return [[]];
+  const out: number[][] = [];
+  const a = [...pool];
+  const m = Math.min(k, a.length);
+  for (let s = 0; s < n; s++) {
+    for (let i = 0; i < m; i++) {
+      const j = rng.int(i, a.length - 1);
+      [a[i], a[j]] = [a[j]!, a[i]!];
+    }
+    out.push(a.slice(0, m));
   }
-  const out: Cand[] = [];
-  if (total < 2) return out;
-  for (let i = 0; i < byLength.length; i++) {
-    if ((masks[i]! & ~mask) !== 0) continue;
-    const w = byLength[i]!;
-    if (w.length > total) continue;
-    if (fits(rc, counts, i)) out.push({ idx: i, reward: wordReward(w) });
-  }
-  out.sort((x, y) => y.reward - x.reward);
   return out;
 }
 
-function fits(rc: number[], counts: Uint8Array, i: number): boolean {
-  const base = i * 26;
-  for (let s = 0; s < 26; s++) if (counts[base + s]! > rc[s]!) return false;
-  return true;
+// Mean best split of rack + each future.
+function meanBest(rc: number[], futures: number[][], beam: number): number {
+  let sum = 0;
+  for (const f of futures) {
+    for (const l of f) rc[l]!++;
+    sum += splitScore(rc, beam);
+    for (const l of f) rc[l]!--;
+  }
+  return sum / futures.length;
 }
 
-function take(rc: number[], counts: Uint8Array, i: number) {
-  const base = i * 26;
-  for (let s = 0; s < 26; s++) rc[s]! -= counts[base + s]!;
+// Samples of the highest rival bid for `letter`, from prices paid in this
+// match, shifted by the difference in letter value. When a rival won, the
+// price is the second-highest bid, so add 1 as a rough correction.
+function priceSamples(letter: string, input: BrainInput, p: BrainParams): number[] {
+  const v = letterValue(letter);
+  const xs: number[] = [];
+  for (const h of (input.history ?? []).slice(-p.priceWindow)) {
+    if (h.winner === null) {
+      xs.push(0);
+      continue;
+    }
+    const x = h.paid - letterValue(h.letter) + v + (h.winner === "other" ? 1 : 0);
+    xs.push(Math.max(1, x));
+  }
+  for (let i = 0; xs.length < p.priorN; i++) xs.push(v + 1 + (i % 5));
+  return xs;
 }
 
-function rackTotal(rc: number[]): number {
-  let t = 0;
-  for (let i = 0; i < 26; i++) t += rc[i]!;
-  return t;
+// Win probability and expected payment per auction for bid b.
+function outcome(b: number, xs: number[], firstPrice: boolean) {
+  let pWin = 0;
+  let spend = 0;
+  for (const x of xs) {
+    const w = x < b ? 1 : x === b ? 0.5 : 0;
+    if (w === 0) continue;
+    pWin += w;
+    spend += w * (firstPrice ? b : Math.max(1, x));
+  }
+  return { pWin: pWin / xs.length, spend: spend / xs.length };
 }
 
-// Take the highest-reward word repeatedly, greedy.
-function greedy(rc: number[], cands: Cand[]): { score: number; idx: number[] } {
-  const { counts } = loadLexicon();
-  let score = 0;
-  const idx: number[] = [];
-  for (const c of cands) {
-    while (fits(rc, counts, c.idx)) {
-      take(rc, counts, c.idx);
-      score += c.reward;
-      idx.push(c.idx);
+function bestBid(
+  value: number,
+  lambda: number,
+  xs: number[],
+  balance: number,
+  firstPrice: boolean,
+): number {
+  if (value <= 0 || balance <= 0) return 0;
+  // Second price: the truthful bid is optimal.
+  if (!firstPrice) return Math.min(balance, Math.floor(value / lambda));
+  let best = 0;
+  let bestU = 0;
+  for (let b = 1; b <= balance; b++) {
+    const o = outcome(b, xs, true);
+    const u = o.pWin * value - lambda * o.spend;
+    if (u > bestU) {
+      bestU = u;
+      best = b;
     }
   }
-  return { score, idx };
+  return best;
 }
 
-// Best set of disjoint words: try each of the first `beam` candidates as the
-// first pick, fill the rest greedily. O(beam * |cands|).
-export function bestSplit(
-  rc: number[],
-  beam: number,
-): { score: number; idx: number[]; words: string[] } {
-  const { byLength, counts } = loadLexicon();
-  const cands = candidates(rc);
-  let best = greedy([...rc], cands);
-  for (let k = 1; k < Math.min(beam, cands.length); k++) {
-    const r = [...rc];
-    take(r, counts, cands[k]!.idx);
-    const rest = greedy(r, cands);
-    const score = cands[k]!.reward + rest.score;
-    if (score > best.score) best = { score, idx: [cands[k]!.idx, ...rest.idx] };
+interface Item {
+  value: number;
+  xs: number[];
+}
+
+// Lambda at which the expected spend on the auctions left equals budget.
+function solveLambda(
+  items: Item[],
+  auctionsLeft: number,
+  budget: number,
+  balance: number,
+  firstPrice: boolean,
+  p: BrainParams,
+): number {
+  const spendAt = (lambda: number) => {
+    let s = 0;
+    for (const it of items) {
+      const b = bestBid(it.value, lambda, it.xs, balance, firstPrice);
+      s += outcome(b, it.xs, firstPrice).spend;
+    }
+    return (auctionsLeft * s) / items.length;
+  };
+  if (spendAt(p.lambdaMin) <= budget) return p.lambdaMin;
+  if (spendAt(LAMBDA_MAX) > budget) return LAMBDA_MAX;
+  let lo = Math.log(p.lambdaMin);
+  let hi = Math.log(LAMBDA_MAX);
+  for (let i = 0; i < 25; i++) {
+    const mid = (lo + hi) / 2;
+    if (spendAt(Math.exp(mid)) > budget) lo = mid;
+    else hi = mid;
   }
-  return { ...best, words: best.idx.map((i) => byLength[i]!) };
+  return Math.exp(hi);
 }
 
-// Minimum word length to play mid-game, graduated by bag size.
-function midGameMinLen(bagRemaining: number, p: BrainParams): number {
-  if (bagRemaining >= 20) return p.playLen;      // plenty of tiles left: hold for longs
-  if (bagRemaining >= 10) return Math.max(5, p.playLen - 2);
-  if (bagRemaining >= 4)  return 3;
-  return 2;
+function seedOf(input: BrainInput, rc: number[]): number {
+  let h = 2166136261;
+  const mix = (n: number) => {
+    h ^= n;
+    h = Math.imul(h, 16777619);
+  };
+  for (const c of rc) mix(c);
+  mix(idx(input.letter));
+  mix(input.bagRemaining);
+  mix(input.balance);
+  return h >>> 0;
 }
 
 export function decide(input: BrainInput, p: BrainParams = DEFAULT_PARAMS): Decision {
-  const { byLength, counts } = loadLexicon();
   const rc = rackToCounts(input.rack);
+
+  if (input.isLastAuction) {
+    return { words: bestSplit(rc, p.beam).keys.map(keyWord), bid: 0 };
+  }
+
+  const rng = new Rng(seedOf(input, rc));
+  const pool = unseenPool(input, rc);
+  const futures = sampleFutures(pool, futureTiles(input, p), p.samples, rng);
+  const firstPrice = input.auctionType === "FirstPrice";
+  const L = idx(input.letter);
+  const xs0 = priceSamples(input.letter, input, p);
+
+  // Pool letters that stand in for the auctions still to come.
+  const others: { l: number; xs: number[] }[] = [];
+  for (let i = 0; i < p.lambdaLetters && pool.length > 0; i++) {
+    const l = pool[rng.int(0, pool.length - 1)]!;
+    others.push({ l, xs: priceSamples(String.fromCharCode(65 + l), input, p) });
+  }
+
+  const valueOf = (l: number, hold: number) => {
+    rc[l]!++;
+    const v = meanBest(rc, futures, p.beam) - hold;
+    rc[l]!--;
+    return v;
+  };
+
+  const evaluate = (balance: number) => {
+    const hold = meanBest(rc, futures, p.beam);
+    const value = valueOf(L, hold);
+    const items: Item[] = [
+      { value, xs: xs0 },
+      ...others.map((o) => ({ value: valueOf(o.l, hold), xs: o.xs })),
+    ];
+    const budget = balance + p.incomeFrac * hold;
+    const lambda = solveLambda(items, input.bagRemaining, budget, balance, firstPrice, p);
+    return { hold, value, lambda };
+  };
+
+  let balance = input.balance;
+  let st = evaluate(balance);
   const words: string[] = [];
 
-  if (input.bagRemaining < p.flushAt) {
-    // Endgame: play the optimal split of the entire rack.
-    for (const i of bestSplit(rc, p.beam).idx) {
-      words.push(byLength[i]!);
-      take(rc, counts, i);
-    }
-  } else {
-    const minLen = midGameMinLen(input.bagRemaining, p);
-    const rackSize = rackTotal(rc);
-
-    // Rack-pressure: if holding too many tiles, play the best word of any length.
-    if (rackSize >= p.maxRack) {
-      const best = candidates(rc)[0];
-      if (best) {
-        words.push(byLength[best.idx]!);
-        take(rc, counts, best.idx);
+  for (let n = 0; n < MAX_WORDS_PER_TURN; n++) {
+    const cands = wordsIn(rc)
+      .sort((a, b) => keyReward(b) - keyReward(a))
+      .slice(0, p.playCands);
+    let best = -1;
+    let bestGain = -Infinity;
+    for (const k of cands) {
+      take(rc, k);
+      const play = keyReward(k) * (1 + p.coinBonus * st.lambda) + meanBest(rc, futures, p.beam);
+      take(rc, k, -1);
+      if (play - st.hold > bestGain) {
+        bestGain = play - st.hold;
+        best = k;
       }
     }
-
-    // Mid-game: keep playing words that meet the length threshold.
-    for (;;) {
-      const c = candidates(rc).find((x) => byLength[x.idx]!.length >= minLen);
-      if (!c) break;
-      words.push(byLength[c.idx]!);
-      take(rc, counts, c.idx);
-    }
+    if (best < 0 || bestGain < p.playMargin) break;
+    take(rc, best);
+    words.push(keyWord(best));
+    balance += keyReward(best);
+    st = evaluate(balance);
   }
 
-  // The last letter can never be played: don't waste budget bidding on it.
-  if (input.isLastAuction) return { words, bid: 0 };
-
-  // Balance after anticipated word rewards.
-  let balance = input.balance;
-  for (const w of words) balance += wordReward(w);
-
-  // Marginal gain: how much better is our best rack-split with this letter?
-  const before = bestSplit(rc, p.beam).score;
-  const withL = [...rc];
-  const charCode = input.letter.charCodeAt(0) - 65;
-  withL[charCode]!++;
-  const gain = bestSplit(withL, p.beam).score - before;
-
-  // Rack balance & synergy heuristics
-  let vowelAdj = 0;
-  let synAdj = 0;
-
-  const totalTiles = rackTotal(rc);
-  const isVowel = "AEIOU".includes(input.letter);
-  const countVowels = rc[0]! + rc[4]! + rc[8]! + rc[14]! + rc[20]!; // A, E, I, O, U
-
-  if (totalTiles >= 3) {
-    const vowelRatio = countVowels / totalTiles;
-    if (vowelRatio < 0.33) {
-      vowelAdj = isVowel ? 3.0 : -2.0;
-    } else if (vowelRatio > 0.55) {
-      vowelAdj = isVowel ? -2.0 : 2.0;
-    }
-  }
-
-  // Synergy: Q without U is a liability; U for Q is critical
-  const hasQ = rc[16]! > 0;
-  const hasU = rc[20]! > 0;
-  if (hasQ && !hasU && input.letter === "U") {
-    synAdj += 5.0;
-  }
-  if (!hasU && input.letter === "Q" && input.bagRemaining < 35) {
-    synAdj -= 4.0;
-  }
-
-  // Avoid multiple awkward consonants (J, Q, X, Z)
-  const isAwkward = "JQXZ".includes(input.letter);
-  const awkwardCount = rc[9]! + rc[16]! + rc[23]! + rc[25]!; // J, Q, X, Z
-  if (isAwkward && awkwardCount >= 1) {
-    synAdj -= 3.5;
-  }
-
-  // Avoid holding 3+ copies of any letter
-  if (rc[charCode]! >= 2) {
-    synAdj -= 3.0;
-  }
-
-  // Bonus for versatile letters S and E
-  if (rc[charCode] === 0) {
-    if (input.letter === "S") synAdj += 2.0;
-    else if (input.letter === "E") synAdj += 1.0;
-  }
-
-  let rawValue =
-    p.a +
-    p.b * letterValue(input.letter) +
-    p.c * gain +
-    p.vowelWeight * vowelAdj +
-    p.synergyWeight * synAdj;
-
-  // In FirstPrice auctions, the winner pays their own bid directly (not 2nd price).
-  // Shading the bid prevents early coin exhaustion.
-  if (input.auctionType === "FirstPrice") {
-    rawValue = Math.max(1, rawValue * 0.72);
-  }
-
-  // Budget pacing: don't stake more than budgetFrac of remaining balance per
-  // auction, but allow at least 1 when balance > 0.
-  const budgetCap = Math.max(1, Math.floor(balance * p.budgetFrac));
-
-  const bid = Math.max(0, Math.min(Math.floor(rawValue), budgetCap, balance));
-  return { words, bid };
+  return { words, bid: bestBid(st.value, st.lambda, xs0, balance, firstPrice) };
 }

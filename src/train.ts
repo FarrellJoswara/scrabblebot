@@ -43,23 +43,21 @@ const OUT_PATH = path.join(
 
 // ─── Param encoding / decoding ───────────────────────────────────────────────
 
+// Tuned params. The others (samples, beam, ...) trade speed for accuracy
+// and keep their defaults.
 const PARAM_KEYS: (keyof BrainParams)[] = [
-  "flushAt", "playLen", "maxRack", "a", "b", "c", "vowelWeight", "synergyWeight", "budgetFrac", "beam",
+  "horizon", "lambdaMin", "incomeFrac", "coinBonus", "playMargin",
 ];
 const DIM = PARAM_KEYS.length;
+const INT_KEYS = new Set<keyof BrainParams>(["horizon"]);
 
 // Hard bounds: keep params in sane ranges.
-const BOUNDS: Record<keyof BrainParams, [number, number]> = {
-  flushAt:       [1,  10],
-  playLen:       [2,  15],
-  maxRack:       [5,  15],
-  a:             [0,  20],
-  b:             [0,  10],
-  c:             [0,  10],
-  vowelWeight:   [0,  5],
-  synergyWeight: [0,  5],
-  budgetFrac:    [0.05, 0.9],
-  beam:          [4,  32],
+const BOUNDS: Partial<Record<keyof BrainParams, [number, number]>> = {
+  horizon:    [0, 8],
+  lambdaMin:  [0.05, 1],
+  incomeFrac: [0, 1],
+  coinBonus:  [0, 1],
+  playMargin: [0, 10],
 };
 
 function encode(p: BrainParams): number[] {
@@ -73,9 +71,7 @@ function decode(v: number[]): BrainParams {
     const [lo, hi] = BOUNDS[k]!;
     // Clamp to bounds and round integers.
     let val = Math.max(lo, Math.min(hi, v[i]!));
-    if (k === "flushAt" || k === "playLen" || k === "maxRack" || k === "beam") {
-      val = Math.round(val);
-    }
+    if (INT_KEYS.has(k)) val = Math.round(val);
     p[k] = val;
   }
   return p as unknown as BrainParams;
