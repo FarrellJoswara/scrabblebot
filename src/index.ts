@@ -27,7 +27,7 @@ import {
 import { Identity } from "spacetimedb";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { decide } from "./brain.js";
+import { decide, TRAINED_PARAMS } from "./brain.js";
 import { loadLexicon } from "./sim/dictionary.js";
 import { display } from "./display.js";
 
@@ -167,7 +167,7 @@ function actOnAuction(
     bagRemaining: match.bagTotal,
     isLastAuction: match.bagTotal === 0,
     balance: participant.balance,
-  });
+  }, TRAINED_PARAMS);
   const ms = (performance.now() - t0).toFixed(0);
 
   for (const word of d.words) {

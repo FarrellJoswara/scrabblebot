@@ -1,0 +1,12 @@
+{
+  "flushAt": 7,
+  "playLen": 9,
+  "maxRack": 10,
+  "a": 1.7272263286654144,
+  "b": 4.540709826208013,
+  "c": 0,
+  "vowelWeight": 5,
+  "synergyWeight": 5,
+  "budgetFrac": 0.9,
+  "beam": 5
+}

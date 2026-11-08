@@ -4,7 +4,7 @@ import { loadLexicon } from "./dictionary.js";
 import type { BotPlayer, Player, SimPlayer, SimStrategy, View } from "./engine.js";
 import type { Rng } from "./rng.js";
 import { chooseWord, decideBid } from "../strategy.js";
-import { decide, DEFAULT_PARAMS, type BrainParams } from "../brain.js";
+import { decide, DEFAULT_PARAMS, TRAINED_PARAMS, type BrainParams } from "../brain.js";
 
 // The six sim bots on the live server. A lobby that times out is padded
 // with a random subset of these.
@@ -52,8 +52,9 @@ export function baseline(name = "baseline"): BotPlayer {
   };
 }
 
-// The new strategy in src/brain.ts.
-export function babbler(params: BrainParams = DEFAULT_PARAMS, name = "babbler"): BotPlayer {
+// The new strategy in src/brain.ts.  Defaults to TRAINED_PARAMS (from
+// best-params.json) so `npm run sim` automatically benchmarks the trained bot.
+export function babbler(params: BrainParams = TRAINED_PARAMS, name = "babbler"): BotPlayer {
   return { kind: "bot", name, act: (view: View) => decide(view, params) };
 }
 
@@ -72,6 +73,8 @@ export function buildLineup(
         return baseline();
       case "babbler":
         return babbler(params);
+      case "ref":
+        return babbler(DEFAULT_PARAMS, `ref-${i}`);
       case "pool": {
         const next = pool.shift();
         if (!next) throw new Error("Sim pool is empty");
